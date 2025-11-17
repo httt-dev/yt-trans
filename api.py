@@ -21,12 +21,16 @@ from enum import Enum
 
 # FastAPI
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 
 # Thư viện xử lý YouTube
 from yt_dlp import YoutubeDL
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import WebshareProxyConfig
+from pytube import YouTube
+
 
 # Thư viện xử lý audio
 from gtts import gTTS
@@ -49,6 +53,12 @@ app = FastAPI(
     description="API để dịch video YouTube sang tiếng Việt với voice-over",
     version="1.0.0"
 )
+
+# Mount static files (output folder)
+Path("output").mkdir(exist_ok=True)
+app.mount("/output", StaticFiles(directory="output"), name="output")
+app.mount("/assets", StaticFiles(directory="assets"), name="assets")
+
 
 # Thread pool để xử lý đồng thời
 executor = ThreadPoolExecutor(max_workers=5)
@@ -87,6 +97,74 @@ class JobResponse(BaseModel):
     updated_at: str
 
 
+class YouTubeTitleExtractor:
+    def __init__(self):
+        self.methods = [self._oembed_method, self._pytube_method, self._scraping_method]
+    
+    def get_title(self, video_url, preferred_method='oembed'):
+        """
+        Lấy title YouTube với multiple fallback methods
+        """
+        # Validate URL
+        if not self._is_valid_youtube_url(video_url):
+            return "URL YouTube không hợp lệ"
+        
+        methods_order = self._get_methods_order(preferred_method)
+        
+        for method in methods_order:
+            try:
+                title = method(video_url)
+                if title:
+                    print(f"Title {method.__name__}: {title}")
+                    return title
+            except Exception as e:
+                print(f"Method {method.__name__} failed: {e}")
+                continue
+                
+        return "Không thể lấy title"
+    
+    def _oembed_method(self, video_url):
+        """Phương pháp oEmbed"""
+        oembed_url = f"https://www.youtube.com/oembed?url={video_url}&format=json"
+        response = requests.get(oembed_url, timeout=10)
+        response.raise_for_status()
+        return response.json().get('title')
+    
+    def _pytube_method(self, video_url):
+        """Phương pháp pytube"""
+        yt = YouTube(video_url)
+        return yt.title
+    
+    def _scraping_method(self, video_url):
+        """Phương pháp web scraping"""
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(video_url, headers=headers, timeout=10)
+        title_match = re.search(r'<title>(.*?) - YouTube</title>', response.text)
+        return title_match.group(1) if title_match else None
+    
+    def _is_valid_youtube_url(self, url):
+        """Kiểm tra URL YouTube hợp lệ"""
+        patterns = [
+            r'^https?://(www\.)?youtube\.com/watch\?v=',
+            r'^https?://youtu\.be/',
+            r'^https?://(www\.)?youtube\.com/embed/'
+        ]
+        return any(re.search(pattern, url) for pattern in patterns)
+    
+    def _get_methods_order(self, preferred):
+        """Sắp xếp thứ tự methods theo preference"""
+        method_map = {
+            'oembed': self._oembed_method,
+            'pytube': self._pytube_method,
+            'scraping': self._scraping_method
+        }
+        
+        if preferred in method_map:
+            preferred_method = method_map[preferred]
+            other_methods = [m for m in self.methods if m != preferred_method]
+            return [preferred_method] + other_methods
+        return self.methods
+    
 class YouTubeTranslator:
     def __init__(self, job_id: str, output_base_dir: str = "output", voice_gender: str = "male"):
         """
@@ -224,23 +302,53 @@ class YouTubeTranslator:
             self.update_job_status(JobStatus.TRANSCRIBING, progress,
                                   f"Đang transcribe đoạn {i+1}/{total_chunks}...")
             
-            try:
-                with sr.AudioFile(str(chunk_path)) as source:
-                    audio_data = recognizer.record(source)
-                    text = recognizer.recognize_google(audio_data, language='en-US')
-                    
-                    segments.append({
-                        'start': start_ms / 1000.0,
-                        'duration': (end_ms - start_ms) / 1000.0,
-                        'text': text
-                    })
-                    print(f"Đoạn {i+1}: {text[:50]}...")
-            except Exception as e:
-                print(f"Không thể transcribe đoạn {i+1}: {e}")
+            # Retry logic cho từng chunk
+            text = None
+            max_retries = 3
+            
+            for retry in range(max_retries):
+                try:
+                    with sr.AudioFile(str(chunk_path)) as source:
+                        audio_data = recognizer.record(source)
+                        text = recognizer.recognize_google(audio_data, language='en-US')
+                        print(f"Đoạn {i+1}: {text[:50]}...")
+                        break  # Thành công, thoát vòng lặp retry
+                        
+                except sr.UnknownValueError:
+                    print(f"Không thể nhận dạng đoạn {i+1} (lần thử {retry+1}/{max_retries})")
+                    if retry == max_retries - 1:
+                        print(f"Bỏ qua đoạn {i+1} sau {max_retries} lần thử")
+                        text = ""  # Gán empty nếu không nhận dạng được
+                        
+                except sr.RequestError as e:
+                    print(f"Lỗi API Google Speech đoạn {i+1} (lần thử {retry+1}/{max_retries}): {e}")
+                    if retry < max_retries - 1:
+                        import time
+                        time.sleep(2 ** retry)  # Exponential backoff: 1s, 2s, 4s
+                    else:
+                        print(f"Bỏ qua đoạn {i+1} sau {max_retries} lần thử")
+                        text = ""
+                        
+                except Exception as e:
+                    print(f"Lỗi không xác định đoạn {i+1} (lần thử {retry+1}/{max_retries}): {e}")
+                    if retry == max_retries - 1:
+                        text = ""
+            
+            # Chỉ thêm segment nếu có text
+            if text:
+                segments.append({
+                    'start': start_ms / 1000.0,
+                    'duration': (end_ms - start_ms) / 1000.0,
+                    'text': text
+                })
             
             chunk_path.unlink()
         
         wav_path.unlink()
+        
+        if not segments:
+            raise Exception("Không thể transcribe bất kỳ đoạn audio nào")
+        
         return segments
     
     def get_transcript(self, url: str) -> List[Dict]:
@@ -252,8 +360,16 @@ class YouTubeTranslator:
         try:
             # Thử phương pháp mới trước (phiên bản >= 0.5.0)
             try:
-                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                # transcript_list = YouTubeTranscriptApi(
+                #     proxy_config=WebshareProxyConfig(
+                #     proxy_username="cvccfzjw",
+                #     proxy_password="b3nz4yr2rc8r",
+                # )
+                # ).list(video_id)
                 
+                transcript_list = YouTubeTranscriptApi().list(video_id)
+                
+
                 # Ưu tiên transcript thủ công (chính xác hơn)
                 try:
                     transcript = transcript_list.find_manually_created_transcript(['en'])
@@ -298,14 +414,57 @@ class YouTubeTranslator:
             "temperature": 0.3,
         }
         
-        try:
-            response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
-            result = response.json()
-            return result['choices'][0]['message']['content'].strip()
-        except Exception as e:
-            print(f"Lỗi DeepSeek API: {e}")
-            return text
+        max_retries = 3
+        last_error = None
+        
+        for retry in range(max_retries):
+            try:
+                response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
+                response.raise_for_status()
+                result = response.json()
+                translated = result['choices'][0]['message']['content'].strip()
+                
+                if translated:  # Đảm bảo có kết quả
+                    return translated
+                else:
+                    raise ValueError("API trả về kết quả rỗng")
+                    
+            except requests.exceptions.Timeout as e:
+                last_error = f"Timeout (lần {retry+1}/{max_retries})"
+                print(f"DeepSeek API timeout (lần thử {retry+1}/{max_retries})")
+                
+            except requests.exceptions.HTTPError as e:
+                last_error = f"HTTP Error {e.response.status_code} (lần {retry+1}/{max_retries})"
+                print(f"DeepSeek API HTTP error {e.response.status_code} (lần thử {retry+1}/{max_retries})")
+                
+                # Không retry nếu là lỗi 4xx (client error)
+                if 400 <= e.response.status_code < 500:
+                    print(f"Lỗi client, không retry. Response: {e.response.text[:200]}")
+                    return text  # Trả về text gốc
+                    
+            except requests.exceptions.RequestException as e:
+                last_error = f"Request Error (lần {retry+1}/{max_retries}): {str(e)}"
+                print(f"DeepSeek API request error (lần thử {retry+1}/{max_retries}): {e}")
+                
+            except (KeyError, ValueError) as e:
+                last_error = f"Parse Error (lần {retry+1}/{max_retries}): {str(e)}"
+                print(f"DeepSeek API parse error (lần thử {retry+1}/{max_retries}): {e}")
+                
+            except Exception as e:
+                last_error = f"Unknown Error (lần {retry+1}/{max_retries}): {str(e)}"
+                print(f"DeepSeek API unknown error (lần thử {retry+1}/{max_retries}): {e}")
+            
+            # Exponential backoff nếu chưa phải lần thử cuối
+            if retry < max_retries - 1:
+                import time
+                wait_time = 2 ** retry  # 1s, 2s, 4s
+                print(f"Đợi {wait_time}s trước khi thử lại...")
+                time.sleep(wait_time)
+        
+        # Sau 3 lần thử vẫn lỗi, trả về text gốc
+        print(f"⚠️ Không thể dịch sau {max_retries} lần thử. Lỗi cuối: {last_error}")
+        print(f"Trả về text gốc: {text[:100]}...")
+        return text
     
     def translate_transcript(self, segments: List[Dict]) -> List[Dict]:
         """Dịch transcript sang tiếng Việt"""
@@ -532,15 +691,433 @@ def process_video_background(job_id: str, youtube_url: str, voice_gender: str):
     except Exception as e:
         print(f"Lỗi xử lý job {job_id}: {e}")
 
+def get_youtube_title_pytube(video_url):
+    """
+    Lấy title video YouTube sử dụng pytube
+    """
+    # try:
+    #     yt = YouTube(video_url)
+    #     return yt.title
+    # except Exception as e:
+    #     print(f"Lỗi: {e}")
+    #     return None
+    extractor = YouTubeTitleExtractor()
+    return extractor.get_title(video_url)
 
-@app.get("/")
+
+@app.get("/", response_class=HTMLResponse)
 def read_root():
-    """Endpoint kiểm tra API"""
-    return {
-        "service": "YouTube Video Translator API",
-        "version": "1.0.0",
-        "status": "running"
-    }
+    """Trang chủ với frontend"""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="vi">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link rel="icon" href="/assets/images/favicon.ico" type="image/x-icon">
+        <title>YouTube Video Translator - Dịch video sang tiếng Việt</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }
+            
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+            }
+            
+            header {
+                background: white;
+                padding: 30px;
+                border-radius: 15px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+                margin-bottom: 30px;
+            }
+            
+            h1 {
+                color: #333;
+                margin-bottom: 20px;
+                font-size: 28px;
+            }
+            
+            .input-group {
+                display: flex;
+                gap: 10px;
+                margin-bottom: 15px;
+            }
+            
+            input[type="text"] {
+                flex: 1;
+                padding: 15px;
+                border: 2px solid #e0e0e0;
+                border-radius: 10px;
+                font-size: 16px;
+                transition: border 0.3s;
+            }
+            
+            input[type="text"]:focus {
+                outline: none;
+                border-color: #667eea;
+            }
+            
+            .voice-select {
+                display: flex;
+                gap: 15px;
+                align-items: center;
+                margin-bottom: 15px;
+            }
+            
+            .voice-option {
+                display: flex;
+                align-items: center;
+                gap: 5px;
+            }
+            
+            button {
+                padding: 15px 40px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                border-radius: 10px;
+                font-size: 16px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: transform 0.2s;
+            }
+            
+            button:hover {
+                transform: translateY(-2px);
+            }
+            
+            button:disabled {
+                opacity: 0.6;
+                cursor: not-allowed;
+            }
+            
+            .status {
+                margin-top: 15px;
+                padding: 15px;
+                border-radius: 10px;
+                display: none;
+            }
+            
+            .status.info {
+                background: #e3f2fd;
+                color: #1976d2;
+                display: block;
+            }
+            
+            .status.success {
+                background: #e8f5e9;
+                color: #388e3c;
+                display: block;
+            }
+            
+            .status.error {
+                background: #ffebee;
+                color: #d32f2f;
+                display: block;
+            }
+            
+            .progress-bar {
+                width: 100%;
+                height: 6px;
+                background: #e0e0e0;
+                border-radius: 3px;
+                overflow: hidden;
+                margin-top: 10px;
+                display: none;
+            }
+            
+            .progress-bar.active {
+                display: block;
+            }
+            
+            .progress-fill {
+                height: 100%;
+                background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+                width: 0%;
+                transition: width 0.3s;
+            }
+            
+            .videos-section {
+                background: white;
+                padding: 30px;
+                border-radius: 15px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            }
+            
+            .videos-section h2 {
+                color: #333;
+                margin-bottom: 20px;
+                font-size: 24px;
+            }
+            
+            .video-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                gap: 20px;
+            }
+            
+            .video-card {
+                background: #f5f5f5;
+                border-radius: 10px;
+                overflow: hidden;
+                cursor: pointer;
+                transition: transform 0.2s, box-shadow 0.2s;
+            }
+            
+            .video-card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+            }
+            
+            .video-thumbnail {
+                width: 100%;
+                height: 180px;
+                object-fit: cover;
+                background: #e0e0e0;
+            }
+            
+            .video-info {
+                padding: 15px;
+            }
+            
+            .video-title {
+                font-weight: 600;
+                color: #333;
+                margin-bottom: 5px;
+                font-size: 14px;
+                line-height: 1.4;
+                display: -webkit-box;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
+                overflow: hidden;
+            }
+            
+            .video-id {
+                color: #666;
+                font-size: 12px;
+            }
+            
+            .empty-state {
+                text-align: center;
+                padding: 60px 20px;
+                color: #999;
+            }
+            
+            .empty-state svg {
+                width: 80px;
+                height: 80px;
+                margin-bottom: 20px;
+                opacity: 0.3;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <h1>🎬 YouTube Video Translator</h1>
+                <p style="color: #666; margin-bottom: 20px;">Dịch video YouTube sang tiếng Việt với voice-over tự động</p>
+                
+                <div class="input-group">
+                    <input 
+                        type="text" 
+                        id="youtubeUrl" 
+                        placeholder="Nhập YouTube URL (vd: https://youtube.com/watch?v=...)"
+                    >
+                    <button id="translateBtn" onclick="translateVideo()">
+                        Dịch sang Tiếng Việt
+                    </button>
+                </div>
+                
+                <div class="voice-select">
+                    <span style="color: #666;">Giọng đọc:</span>
+                    <div class="voice-option">
+                        <input type="radio" id="voiceMale" name="voice" value="male" checked>
+                        <label for="voiceMale">Nam</label>
+                    </div>
+                    <div class="voice-option">
+                        <input type="radio" id="voiceFemale" name="voice" value="female">
+                        <label for="voiceFemale">Nữ</label>
+                    </div>
+                </div>
+                
+                <div id="status" class="status"></div>
+                <div id="progressBar" class="progress-bar">
+                    <div id="progressFill" class="progress-fill"></div>
+                </div>
+            </header>
+            
+            <div class="videos-section">
+                <h2>📚 Video đã dịch</h2>
+                <div id="videoGrid" class="video-grid">
+                    <div class="empty-state">
+                        <svg fill="currentColor" viewBox="0 0 20 20">
+                            <path d="M2 6a2 2 0 012-2h6a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V6zM14.553 7.106A1 1 0 0014 8v4a1 1 0 00.553.894l2 1A1 1 0 0018 13V7a1 1 0 00-1.447-.894l-2 1z"/>
+                        </svg>
+                        <p>Chưa có video nào được dịch</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            let currentJobId = null;
+            let pollingInterval = null;
+            
+            async function translateVideo() {
+                const url = document.getElementById('youtubeUrl').value.trim();
+                const voiceGender = document.querySelector('input[name="voice"]:checked').value;
+                
+                if (!url) {
+                    showStatus('Vui lòng nhập YouTube URL', 'error');
+                    return;
+                }
+                
+                const btn = document.getElementById('translateBtn');
+                btn.disabled = true;
+                btn.textContent = 'Đang xử lý...';
+                
+                showStatus('Đang tạo job dịch video...', 'info');
+                
+                try {
+                    const response = await fetch('/translate', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            youtube_url: url,
+                            voice_gender: voiceGender
+                        })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        currentJobId = data.job_id;
+                        showStatus(`Job đã tạo! ID: ${currentJobId.substring(0, 8)}...`, 'info');
+                        startPolling(currentJobId);
+                    } else {
+                        throw new Error(data.detail || 'Lỗi khi tạo job');
+                    }
+                } catch (error) {
+                    showStatus('Lỗi: ' + error.message, 'error');
+                    btn.disabled = false;
+                    btn.textContent = 'Dịch sang Tiếng Việt';
+                }
+            }
+            
+            function startPolling(jobId) {
+                const progressBar = document.getElementById('progressBar');
+                const progressFill = document.getElementById('progressFill');
+                progressBar.classList.add('active');
+                
+                pollingInterval = setInterval(async () => {
+                    try {
+                        const response = await fetch(`/status/${jobId}`);
+                        const data = await response.json();
+                        
+                        progressFill.style.width = data.progress + '%';
+                        showStatus(`${data.message} (${data.progress}%)`, 'info');
+                        
+                        if (data.status === 'completed') {
+                            clearInterval(pollingInterval);
+                            showStatus('✅ Hoàn thành! Đang tải lại danh sách...', 'success');
+                            progressBar.classList.remove('active');
+                            
+                            const btn = document.getElementById('translateBtn');
+                            btn.disabled = false;
+                            btn.textContent = 'Dịch sang Tiếng Việt';
+                            
+                            // Reload videos
+                            setTimeout(() => {
+                                loadVideos();
+                                document.getElementById('youtubeUrl').value = '';
+                            }, 1000);
+                            
+                        } else if (data.status === 'failed') {
+                            clearInterval(pollingInterval);
+                            showStatus('❌ Lỗi: ' + (data.error || 'Không xác định'), 'error');
+                            progressBar.classList.remove('active');
+                            
+                            const btn = document.getElementById('translateBtn');
+                            btn.disabled = false;
+                            btn.textContent = 'Dịch sang Tiếng Việt';
+                        }
+                    } catch (error) {
+                        console.error('Polling error:', error);
+                    }
+                }, 2000);
+            }
+            
+            function showStatus(message, type) {
+                const status = document.getElementById('status');
+                status.textContent = message;
+                status.className = 'status ' + type;
+            }
+            
+            async function loadVideos() {
+                try {
+                    const response = await fetch('/api/videos');
+                    const data = await response.json();
+                    
+                    const grid = document.getElementById('videoGrid');
+                    
+                    if (data.videos.length === 0) {
+                        grid.innerHTML = `
+                            <div class="empty-state">
+                                <svg fill="currentColor" viewBox="0 0 20 20">
+                                    <path d="M2 6a2 2 0 012-2h6a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V6zM14.553 7.106A1 1 0 0014 8v4a1 1 0 00.553.894l2 1A1 1 0 0018 13V7a1 1 0 00-1.447-.894l-2 1z"/>
+                                </svg>
+                                <p>Chưa có video nào được dịch</p>
+                            </div>
+                        `;
+                        return;
+                    }
+                    
+                    grid.innerHTML = data.videos.map(video => `
+                        <div class="video-card" onclick="window.open('/output/${video.video_id}/${video.filename}', '_blank')">
+                            <img 
+                                src="https://img.youtube.com/vi/${video.video_id}/mqdefault.jpg" 
+                                alt="${video.title || video.video_id}"
+                                class="video-thumbnail"
+                            >
+                            <div class="video-info">
+                                <div class="video-title">${video.title || 'Video đã dịch'}</div>
+                                <div class="video-id">ID: ${video.video_id}</div>
+                            </div>
+                        </div>
+                    `).join('');
+                } catch (error) {
+                    console.error('Load videos error:', error);
+                }
+            }
+            
+            // Load videos on page load
+            loadVideos();
+            
+            // Enter key support
+            document.getElementById('youtubeUrl').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    translateVideo();
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 
 @app.post("/translate", response_model=JobResponse)
@@ -626,6 +1203,50 @@ def download_video(job_id: str):
             media_type="video/mp4",
             filename=output_file
         )
+
+
+@app.get("/api/videos")
+def list_translated_videos():
+    """
+    API để list tất cả video đã dịch trong folder output
+    """
+    output_dir = Path("output")
+    videos = []
+    
+    if not output_dir.exists():
+        return {"videos": []}
+    
+    # Duyệt qua các folder video_id
+    for video_dir in output_dir.iterdir():
+        if not video_dir.is_dir():
+            continue
+        
+        video_id = video_dir.name
+        
+        # Tìm file *_vietnamese.mp4
+        vietnamese_files = list(video_dir.glob("*_vietnamese.mp4"))
+        
+        if vietnamese_files:
+            video_file = vietnamese_files[0]
+            # Lấy title video sử dụng pytube
+            title = get_youtube_title_pytube(f"https://www.youtube.com/watch?v={video_id}")
+            
+            # Lấy thông tin file
+            file_stat = video_file.stat()
+            
+            videos.append({
+                "video_id": video_id,
+                "filename": video_file.name,
+                "title": title,  
+                "file_size": file_stat.st_size,
+                "created_at": datetime.fromtimestamp(file_stat.st_ctime).isoformat(),
+                "url": f"/output/{video_id}/{video_file.name}"
+            })
+    
+    # Sắp xếp theo thời gian tạo (mới nhất trước)
+    videos.sort(key=lambda x: x['created_at'], reverse=True)
+    
+    return {"videos": videos}
 
 
 @app.get("/jobs")

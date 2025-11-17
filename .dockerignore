@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Output files (sẽ mount từ volume)
+output/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Docker
+.dockerignore
+Dockerfile
+docker-compose.yml
+
+# Env
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db

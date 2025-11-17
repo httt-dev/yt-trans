@@ -3,7 +3,7 @@ import time
 
 # 1. Tạo job
 response = requests.post("http://localhost:8000/translate", json={
-    "youtube_url": "https://www.youtube.com/watch?v=P0Fk-K2eZF8",
+    "youtube_url": "https://www.youtube.com/watch?v=3FsDvRRf4cg",
     "voice_gender": "male"
 })
 job_id = response.json()["job_id"]

@@ -1,0 +1,48 @@
+
+services:
+  yt-translator:
+    build: .
+    container_name: yt-translator
+    restart: unless-stopped
+    environment:
+      # API Key
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      
+      # nginx-proxy configuration
+      - VIRTUAL_HOST=yt.h3t.dev
+      - VIRTUAL_PORT=8000
+      - LETSENCRYPT_HOST=yt.h3t.dev
+      - LETSENCRYPT_EMAIL=httt.dev@gmail.com
+      
+    volumes:
+      # Mount output folder để persist data
+      - ./output:/app/output
+      # Optional: mount logs
+      - ./logs:/app/logs
+      
+    networks:
+      - default
+      - nginx-proxy  # Kết nối với network của nginx-proxy
+      
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+      
+    # Resource limits (optional)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+networks:
+  nginx-proxy:
+    external: true  # Sử dụng network có sẵn của nginx-proxy
+  default:
+    driver: bridge

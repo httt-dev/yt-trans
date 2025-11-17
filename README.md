@@ -14,7 +14,7 @@ pip uninstall youtube-transcript-api -y
 
 pip install youtube-transcript-api --upgrade  
 
-pip install SpeechRecognition pydub        
+pip install SpeechRecognition pydub 
 
 python.exe .\main.py              
 
@@ -74,3 +74,8 @@ curl "http://localhost:8000/jobs?status=completed"
 
 DELETE /job/{job_id} - Xóa job và files
 curl -X DELETE "http://localhost:8000/job/abc-123-def"
+
+
+## Working around IP bans (RequestBlocked or IpBlocked exception)
+https://github.com/jdepoix/youtube-transcript-api?tab=readme-ov-file#working-around-ip-bans-requestblocked-or-ipblocked-exception
+https://dashboard.webshare.io/proxy/settings
