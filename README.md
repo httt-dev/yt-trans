@@ -40,6 +40,7 @@ set DEEPSEEK_API_KEY=your-api-key-here
 
 ### Windows PowerShell
 $env:DEEPSEEK_API_KEY="your-api-key-here"
+$env:TRANS_FROM_AUDIO="True"
 
 ## 🚀 Chạy ứng dụng FastAPI
 python api.py

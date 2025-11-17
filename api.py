@@ -9,11 +9,13 @@ import os
 import json
 import re
 import uuid
+import time
 import shutil
 from pathlib import Path
 from typing import List, Dict, Optional
 from datetime import datetime
 import requests
+import random
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -44,8 +46,11 @@ except ImportError:
     SPEECH_RECOGNITION_AVAILABLE = False
 
 # Lấy API keys từ biến môi trường
-DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+# Support one or multiple DeepSeek API keys separated by comma in the env var
+# Example: DEEPSEEK_API_KEY="key1,key2,key3"
+DEEPSEEK_API_KEYS = [k.strip() for k in os.getenv('DEEPSEEK_API_KEY', '').split(',') if k.strip()]
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+TRANS_FROM_AUDIO = os.getenv('TRANS_FROM_AUDIO', 'False').lower() == 'true'
 
 # FastAPI app
 app = FastAPI(
@@ -182,6 +187,11 @@ class YouTubeTranslator:
         self.voice_gender = voice_gender
         self.temp_files = []
         
+        # Đường dẫn đến cookies file
+        self.cookies_file = Path("/app/cookies.txt")
+        if self.cookies_file.exists() is False:
+            self.cookies_file = Path("cookies.txt")
+
     def setup_job_directory(self, video_id: str):
         """Tạo thư mục riêng cho video theo video_id"""
         self.job_dir = self.output_base_dir / video_id
@@ -211,6 +221,33 @@ class YouTubeTranslator:
                 if error:
                     jobs_status[self.job_id]['error'] = error
     
+    def get_ydl_opts(self, output_template: str, extract_audio: bool = False):
+        """Tạo yt-dlp options với cookies nếu có"""
+        opts = {
+            'outtmpl': output_template,
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        # Thêm cookies nếu file tồn tại
+        if self.cookies_file.exists():
+            opts['cookiefile'] = str(self.cookies_file)
+            print(f"[{self.job_id[:8]}] Sử dụng cookies từ {self.cookies_file}")
+        else:
+            print(f"[{self.job_id[:8]}] ⚠️ Không tìm thấy cookies.txt, có thể gặp lỗi bot detection")
+        
+        if extract_audio:
+            opts['format'] = 'bestaudio/best'
+            opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        else:
+            opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        
+        return opts
+    
     def download_video(self, url: str) -> str:
         """Tải video YouTube"""
         self.update_job_status(JobStatus.DOWNLOADING, 10, "Đang tải video...")
@@ -225,13 +262,17 @@ class YouTubeTranslator:
             self.temp_files.append(output_path)
             return str(output_path)
         
-        ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'outtmpl': str(self.job_dir / f"{video_id}.%(ext)s"),
-            'quiet': True,
-            'no_warnings': True,
-        }
-        
+        # ydl_opts = {
+        #     'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        #     'outtmpl': str(self.job_dir / f"{video_id}.%(ext)s"),
+        #     'quiet': True,
+        #     'no_warnings': True,
+        # }
+        ydl_opts = self.get_ydl_opts(
+            output_template=str(self.job_dir / f"{video_id}.%(ext)s"),
+            extract_audio=False
+        )
+
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
@@ -248,18 +289,22 @@ class YouTubeTranslator:
             self.temp_files.append(output_path)
             return str(output_path)
         
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'outtmpl': str(self.job_dir / f"{video_id}_audio.%(ext)s"),
-            'quiet': True,
-            'no_warnings': True,
-        }
-        
+        # ydl_opts = {
+        #     'format': 'bestaudio/best',
+        #     'postprocessors': [{
+        #         'key': 'FFmpegExtractAudio',
+        #         'preferredcodec': 'mp3',
+        #         'preferredquality': '192',
+        #     }],
+        #     'outtmpl': str(self.job_dir / f"{video_id}_audio.%(ext)s"),
+        #     'quiet': True,
+        #     'no_warnings': True,
+        # }
+        ydl_opts = self.get_ydl_opts(
+            output_template=str(self.job_dir / f"{video_id}_audio.%(ext)s"),
+            extract_audio=True
+        )
+            
         with YoutubeDL(ydl_opts) as ydl:
             print(f"Đang tải audio: {url}")
             ydl.download([url])
@@ -351,6 +396,58 @@ class YouTubeTranslator:
         
         return segments
     
+    def _merge_segments_by_duration(self, segments: List, target_duration: float = 30.0) -> List[Dict]:
+        """Gộp các đoạn transcript nhỏ thành các đoạn dài khoảng target_duration giây"""
+        merged_segments = []
+        current_text = []
+        current_start = 0.0
+        current_duration = 0.0
+        
+        for segment in segments:
+            segment_text = segment.text.strip()
+            segment_start = segment.start
+            segment_duration = segment.duration
+            
+            # Bỏ qua đoạn trống
+            if not segment_text:
+                continue
+            
+            # Nếu đây là đoạn đầu tiên
+            if not current_text:
+                current_start = segment_start
+                current_duration = segment_duration
+                current_text.append(segment_text)
+            else:
+                # Kiểm tra xem thêm đoạn này có vượt quá target_duration không
+                potential_duration = segment_start + segment_duration - current_start
+                
+                if potential_duration <= target_duration:
+                    # Thêm vào đoạn hiện tại
+                    current_text.append(segment_text)
+                    current_duration = segment_start + segment_duration - current_start
+                else:
+                    # Kết thúc đoạn hiện tại và bắt đầu đoạn mới
+                    merged_segments.append({
+                        "text": " ".join(current_text),
+                        "start": current_start,
+                        "duration": current_duration
+                    })
+                    
+                    # Bắt đầu đoạn mới
+                    current_start = segment_start
+                    current_duration = segment_duration
+                    current_text = [segment_text]
+        
+        # Thêm đoạn cuối cùng nếu còn
+        if current_text:
+            merged_segments.append({
+                "text": " ".join(current_text),
+                "start": current_start,
+                "duration": current_duration
+            })
+        
+        return merged_segments
+    
     def get_transcript(self, url: str) -> List[Dict]:
         """Lấy transcript từ YouTube"""
         self.update_job_status(JobStatus.TRANSCRIBING, 20, "Đang lấy transcript...")
@@ -360,6 +457,10 @@ class YouTubeTranslator:
         try:
             # Thử phương pháp mới trước (phiên bản >= 0.5.0)
             try:
+
+                if TRANS_FROM_AUDIO:
+                    return self.transcribe_from_audio(url)
+                
                 # transcript_list = YouTubeTranscriptApi(
                 #     proxy_config=WebshareProxyConfig(
                 #     proxy_username="cvccfzjw",
@@ -382,20 +483,40 @@ class YouTubeTranslator:
                 segments = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
             
             print(f"Đã lấy {len(segments)} đoạn transcript")
-            return segments
             
+            # 🔹 Gộp các đoạn nhỏ thành các đoạn 30 giây
+            merged_segments = self._merge_segments_by_duration(segments, target_duration=30.0)
+            
+            print(f"Đã gộp thành {len(merged_segments)} đoạn transcript dài")
+
+            # 🔹 Chuyển sang list of dict để JSON serializable
+            segments_list = [
+                {
+                    "text": segment["text"],
+                    "start": segment["start"],
+                    "duration": segment["duration"]
+                }
+                for segment in merged_segments
+            ]
+            
+            return segments_list
+        
         except Exception as e:
             print(f"Lỗi khi lấy transcript: {e}")
             print("Video không có transcript. Sẽ sử dụng speech recognition...")
             return self.transcribe_from_audio(url)
     
+
     def translate_with_deepseek(self, text: str) -> str:
         """Dịch văn bản sang tiếng Việt bằng DeepSeek API"""
-        if not DEEPSEEK_API_KEY:
+        if not DEEPSEEK_API_KEYS:
             raise ValueError("Chưa thiết lập DEEPSEEK_API_KEY")
         
+        api_key = random.choice(DEEPSEEK_API_KEYS)
+
         headers = {
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
+
             "Content-Type": "application/json"
         }
         
@@ -417,9 +538,11 @@ class YouTubeTranslator:
         max_retries = 3
         last_error = None
         
+        time.sleep(1)
+
         for retry in range(max_retries):
             try:
-                response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
+                response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=45)
                 response.raise_for_status()
                 result = response.json()
                 translated = result['choices'][0]['message']['content'].strip()
@@ -456,8 +579,7 @@ class YouTubeTranslator:
             
             # Exponential backoff nếu chưa phải lần thử cuối
             if retry < max_retries - 1:
-                import time
-                wait_time = 2 ** retry  # 1s, 2s, 4s
+                wait_time = 60 ** retry  # 1s, 2s, 4s
                 print(f"Đợi {wait_time}s trước khi thử lại...")
                 time.sleep(wait_time)
         
@@ -936,10 +1058,9 @@ def read_root():
                         placeholder="Nhập YouTube URL (vd: https://youtube.com/watch?v=...)"
                     >
                     <button id="translateBtn" onclick="translateVideo()">
-                        Dịch sang Tiếng Việt
+                        Dịch
                     </button>
                 </div>
-                
                 <div class="voice-select">
                     <span style="color: #666;">Giọng đọc:</span>
                     <div class="voice-option">
@@ -951,7 +1072,6 @@ def read_root():
                         <label for="voiceFemale">Nữ</label>
                     </div>
                 </div>
-                
                 <div id="status" class="status"></div>
                 <div id="progressBar" class="progress-bar">
                     <div id="progressFill" class="progress-fill"></div>

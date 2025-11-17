@@ -7,7 +7,7 @@ services:
     environment:
       # API Key
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-      
+      - TRANS_FROM_AUDIO=${TRANS_FROM_AUDIO}
       # nginx-proxy configuration
       - VIRTUAL_HOST=yt.h3t.dev
       - VIRTUAL_PORT=8000
@@ -19,6 +19,8 @@ services:
       - ./output:/app/output
       # Optional: mount logs
       - ./logs:/app/logs
+      # Mount cookies.txt để bypass bot detection
+      - ./cookies.txt:/app/cookies.txt
       
     networks:
       - default
